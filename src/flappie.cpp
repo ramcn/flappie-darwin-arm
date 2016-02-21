@@ -69,6 +69,7 @@ SOFTWARE.
 
 // Doesn't play nice with other headers, include last
 #include <argp.h>
+#define MAX_THREADS 4
 
 
 static char doc[] = "Flappie basecaller -- basecall from raw signal";
@@ -357,37 +358,38 @@ int tile_size;
 int tile_overlap;
 
 //Multi-threading
-int num_threads;
+int num_references;
 
 
-static std::string reference_string;
+static std::string reference_string[MAX_THREADS];
 static std::string query_string;
 
-uint32_t reference_length;
+uint32_t reference_length[MAX_THREADS];
+std::string reference_filenames[MAX_THREADS];
 uint32_t query_length;
 
-std::vector<long long int> reference_lengths;
-std::vector<std::string> reference_seqs;
+std::vector<long long int> reference_lengths[MAX_THREADS];
+std::vector<std::string> reference_seqs[MAX_THREADS];
 
 std::vector<long long int> reads_lengths;
 uint32_t read_length;
 std::vector<std::string> reads_seqs;
 std::vector<std::string> rev_reads_seqs;
 
-std::vector<std::vector<std::string> > reference_descrips;
-std::vector<long long int> reference_fileposs;
+std::vector<std::vector<std::string> > reference_descrips[MAX_THREADS];
+std::vector<long long int> reference_fileposs[MAX_THREADS];
 
 std::vector<std::vector<std::string> > read_descrip;
 std::vector<long long int> reads_fileposs;
 
-char* reference_char;
+char* reference_char[MAX_THREADS];
 char** reads_char;
 char** rev_reads_char;
 
-std::map<int, uint32_t> chr_id_to_start_bin;
-std::map<uint32_t, int> bin_to_chr_id;
+std::map<int, uint32_t> chr_id_to_start_bin[MAX_THREADS];
+std::map<uint32_t, int> bin_to_chr_id[MAX_THREADS];
 
-SeedPosTable *sa;
+SeedPosTable *sa[MAX_THREADS];
 
 std::mutex io_lock;
 
@@ -440,31 +442,34 @@ bool CompareAlignments(Alignment a1, Alignment a2) {
 int mode;
 int l1l2enable;
 
-void AlignRead (int start_read_num, int last_read_num, int num_threads) {
+// called as align_threads.push_back(std::thread(AlignRead, thread_id, num_reads, num_references));
+//void AlignRead (int start_read_num, int last_read_num, int num_references) {
+void AlignRead (int k, int num_reads, int num_references) {
 
     uint32_t log_bin_size = (uint32_t) (log2(bin_size));
-    int num_bins = 1 + (reference_length >> log_bin_size);
+    int num_bins = 1 + (reference_length[k] >> log_bin_size);
     uint64_t* candidate_hit_offset;
 
     uint32_t* nz_bins_array = new uint32_t[num_nz_bins];
     uint64_t* bin_count_offset_array = new uint64_t[num_bins];
     candidate_hit_offset = new uint64_t[max_candidates];
 
+    std::cout << "Aligned read called from thread " << k << " " << std::endl;
     for(int i=0; i < num_bins; i++) {
         bin_count_offset_array[i] = 0;
     }
 
-    for (int k = start_read_num; k < last_read_num; k+=num_threads) {
+    //for (int k = start_read_num; k < last_read_num; k+=num_threads) {
 
         int len = read_length;
         vector<Alignment> alignments;
         alignments.clear();
-        int thread_id = k % num_threads;
+        //int thread_id = k % num_threads;
 
         // Forward reads
         
         int num_candidates;
-           num_candidates = sa->DSOFT(reads_char[k], len, num_seeds, dsoft_threshold, candidate_hit_offset, bin_count_offset_array, nz_bins_array, max_candidates);
+           num_candidates = sa[k]->DSOFT(reads_char[k], len, num_seeds, dsoft_threshold, candidate_hit_offset, bin_count_offset_array, nz_bins_array, max_candidates);
 
 
         // TODO: Need to apply more filtering here to avoid duplicate and
@@ -473,23 +478,23 @@ void AlignRead (int start_read_num, int last_read_num, int num_threads) {
             uint32_t candidate_hit = (candidate_hit_offset[i] >> 32);
             uint32_t last_hit_offset = ((candidate_hit_offset[i] << 32) >> 32);
 
-            int chr_id = bin_to_chr_id[candidate_hit/bin_size];
-            std::string chrom = reference_descrips[chr_id][0];
-            uint32_t start_bin = chr_id_to_start_bin[chr_id];
+            int chr_id = bin_to_chr_id[k][candidate_hit/bin_size];
+            std::string chrom = reference_descrips[k][chr_id][0];
+            uint32_t start_bin = chr_id_to_start_bin[k][chr_id];
 
             uint32_t ref_pos = candidate_hit - (start_bin*bin_size);
             uint32_t query_pos = last_hit_offset;
-            uint32_t ref_len = reference_lengths[chr_id];
+            uint32_t ref_len = reference_lengths[k][chr_id];
             uint32_t query_len = read_length;
-            char* ref_start = reference_char + (start_bin*bin_size);
+            char* ref_start = reference_char[k] + (start_bin*bin_size);
             char strand = '+';
 
-            Alignment align = GACT(ref_start, reads_char[k], chrom,  gact_sub_mat, gap_open, gap_extend, tile_size, tile_overlap, ref_pos, query_pos, ref_len, query_len, strand, first_tile_score_threshold, mode, thread_id);
+            Alignment align = GACT(ref_start, reads_char[k], chrom,  gact_sub_mat, gap_open, gap_extend, tile_size, tile_overlap, ref_pos, query_pos, ref_len, query_len, strand, first_tile_score_threshold, mode, k);
             alignments.push_back(align);
         }
 
         // Reverse complement reads
-             num_candidates = sa->DSOFT(rev_reads_char[k], len, num_seeds, dsoft_threshold, candidate_hit_offset, bin_count_offset_array, nz_bins_array, max_candidates);
+             num_candidates = sa[k]->DSOFT(rev_reads_char[k], len, num_seeds, dsoft_threshold, candidate_hit_offset, bin_count_offset_array, nz_bins_array, max_candidates);
 
         // TODO: Need to apply more filtering here to avoid duplicate and
         // unnecessary alignments
@@ -497,19 +502,19 @@ void AlignRead (int start_read_num, int last_read_num, int num_threads) {
             uint32_t candidate_hit = (candidate_hit_offset[i] >> 32);
             uint32_t last_hit_offset = ((candidate_hit_offset[i] << 32) >> 32);
 
-            int chr_id = bin_to_chr_id[candidate_hit/bin_size];
-            std::string chrom = reference_descrips[chr_id][0];
-            uint32_t start_bin = chr_id_to_start_bin[chr_id];
+            int chr_id = bin_to_chr_id[k][candidate_hit/bin_size];
+            std::string chrom = reference_descrips[k][chr_id][0];
+            uint32_t start_bin = chr_id_to_start_bin[k][chr_id];
 
             uint32_t ref_pos = candidate_hit - (start_bin*bin_size);
             uint32_t query_pos = last_hit_offset;
-            uint32_t ref_len = reference_lengths[chr_id];
+            uint32_t ref_len = reference_lengths[k][chr_id];
             uint32_t query_len = read_length;
-            char* ref_start = reference_char + (start_bin*bin_size);
+            char* ref_start = reference_char[k] + (start_bin*bin_size);
             char strand = '-';
             
 
-            Alignment align = GACT(ref_start, rev_reads_char[k], chrom, gact_sub_mat, gap_open, gap_extend, tile_size, tile_overlap, ref_pos, query_pos, ref_len, query_len, strand, first_tile_score_threshold, mode, thread_id);
+            Alignment align = GACT(ref_start, rev_reads_char[k], chrom, gact_sub_mat, gap_open, gap_extend, tile_size, tile_overlap, ref_pos, query_pos, ref_len, query_len, strand, first_tile_score_threshold, mode, k);
             alignments.push_back(align);
         }
 
@@ -549,10 +554,16 @@ void AlignRead (int start_read_num, int last_read_num, int num_threads) {
         for (int m=0; m < num_alignments; m++) {
             if (flags[m] >= 0) {
                 Alignment align = alignments[m];
+                std::string ext = ".maf";
+    		std::ofstream out(reference_filenames[k].append(ext));
+    		std::streambuf *coutbuf = std::cout.rdbuf(); //save old buf
+		std::cout.rdbuf(out.rdbuf());
+
                 std::cout << "a score=" << align.score << std::endl;
                 std::cout << "s\t" << align.ref_name << "\t" << 1+align.ref_start << "\t" << align.aligned_ref_len << "\t+\t" << align.ref_len << "\t" << align.aligned_ref_str << std::endl;
                 std::cout << "s\t" << align.query_name << "\t" << 1+align.query_start << "\t" << align.aligned_query_len << "\t" << align.strand << "\t" << align.query_len << "\t" << align.aligned_query_str << std::endl;
                 std::cout << std::endl;
+    		std::cout.rdbuf(coutbuf); //reset to standard output again
             }
         }
         io_lock.unlock();
@@ -563,7 +574,7 @@ void AlignRead (int start_read_num, int last_read_num, int num_threads) {
 									  reverse_kernel_counter << " times\n";
             io_lock.unlock();
         }
-    }
+    // } end of num reads
 
     delete[] bin_count_offset_array;
     delete[] nz_bins_array;
@@ -573,10 +584,8 @@ void AlignRead (int start_read_num, int last_read_num, int num_threads) {
 
 int main(int argc, char *argv[]) {
 
-    if (argc < 5) {
-        std::cerr << "Usage: ./darwin_ref_guided <REFERENCE>.fasta <READS>.fasta mode l1l2enable"<< endl;
-	std::cerr << "(mode is 0: default darwin original, 1: cpu darwin-xl, 2:fpga darwin-xl)"<< endl;
-	std::cerr << "(l1l2enable is 0: default darwin original, 1:l1l2enable)"<< endl;
+    if (argc < 3) {
+        std::cerr << "Usage: ./darwin_ref_guided <READS.fasta> <REFERENCE1>.fasta <REFERECE2>.fasta ..."<< endl;
         exit(1);
     }
     struct timeval start, end_time;
@@ -628,22 +637,16 @@ int main(int argc, char *argv[]) {
     tile_overlap = cfg.Value("GACT_extend", "tile_overlap");
 
     // Multi-threading
-    num_threads = cfg.Value("Multithreading", "num_threads");
+    num_references = cfg.Value("Multithreading", "num_threads");
 
     seed_shape = seed_shape_str.c_str();
 
-    std::string reference_filename(argv[1]);
-    std::string reads_dirname(argv[2]);
-    mode = std::stoi(argv[3]);
-    l1l2enable = std::stoi(argv[4]);
-
-    if(mode == 1)
-	std::cerr<< "Using Darwin-XL CPU implementation"<<std::endl;
-    else if(mode == 2) {
-	std::cerr<< "Using Darwin-XL FPGA implementation  supported on this"<<std::endl;
+    for(int j=0;j<num_references; j++) {
+    	reference_filenames[j].assign(argv[2+j]);
     }
-    else
-	std::cerr<< "Using Old Darwin CPU implementation"<<std::endl;
+
+    std::string reads_dirname(argv[1]);
+
 
 #ifdef FPGA
     if(!init()) {
@@ -658,31 +661,32 @@ int main(int argc, char *argv[]) {
     long mseconds = ((seconds) * 1000 + useconds/1000.0) + 0.5;
     std::cerr << "Time elapsed (reading configuration file): " << mseconds <<" msec" << std::endl;
 
+  for(int k=0; k < num_references; k++) {
     // LOAD REFERENCE
-    std::cerr << "\nLoading reference genome ...\n";
+    std::cerr << "\nLoading reference genome" << k << "...\n"<< std::endl;
     gettimeofday(&start, NULL);
 
-    ParseFastaFile(reference_filename, reference_descrips, reference_seqs, reference_lengths, reference_fileposs);
+    ParseFastaFile(reference_filenames[k], reference_descrips[k], reference_seqs[k], reference_lengths[k], reference_fileposs[k]);
 
-    reference_string = "";
+    reference_string[k] = "";
 
     int curr_bin = 0;
 
-    for (size_t i=0; i < reference_seqs.size(); i++) {
-        chr_id_to_start_bin[i] =  curr_bin;
-        reference_string += reference_seqs[i];
-        for (size_t j = 0; j < (reference_seqs[i].length() / bin_size); j++) {
-            bin_to_chr_id[curr_bin++] = i;
+    for (size_t i=0; i < reference_seqs[k].size(); i++) {
+        chr_id_to_start_bin[k][i] =  curr_bin;
+        reference_string[k] += reference_seqs[k][i];
+        for (size_t j = 0; j < (reference_seqs[k][i].length() / bin_size); j++) {
+            bin_to_chr_id[k][curr_bin++] = i;
         }
-        if (reference_seqs[i].length() % bin_size > 0) {
-            reference_string += std::string((bin_size - (reference_seqs[i].length() % bin_size)), 'N');
-            bin_to_chr_id[curr_bin++] = i;
+        if (reference_seqs[k][i].length() % bin_size > 0) {
+            reference_string[k] += std::string((bin_size - (reference_seqs[k][i].length() % bin_size)), 'N');
+            bin_to_chr_id[k][curr_bin++] = i;
         }
     }
 
-    reference_length = reference_string.length();
-    reference_char = (char*) reference_string.c_str();
-    std::cerr << "Reference length (after padding): " << (unsigned int) reference_length << std::endl;
+    reference_length[k] = reference_string[k].length();
+    reference_char[k] = (char*) reference_string[k].c_str();
+    std::cerr << "Reference length (after padding): " << (unsigned int) reference_length[k] << std::endl;
 
     gettimeofday(&end_time, NULL);
     useconds = end_time.tv_usec - start.tv_usec;
@@ -693,13 +697,15 @@ int main(int argc, char *argv[]) {
     // CONSTRUCT SEED POSITION TABLE
     gettimeofday(&start, NULL);
        std::cerr << "\nConstructing seed position table ...\n";
-       sa = new SeedPosTable(reference_char, reference_length, seed_shape, seed_occurence_multiple, bin_size);
+       sa[k] = new SeedPosTable(reference_char[k], reference_length[k], seed_shape, seed_occurence_multiple, bin_size);
     gettimeofday(&end_time, NULL);
     useconds = end_time.tv_usec - start.tv_usec;
     seconds = end_time.tv_sec - start.tv_sec;
     mseconds = ((seconds) * 1000 + useconds/1000.0) + 0.5;
     std::cerr << "Time elapsed (seed position table construction): " << mseconds <<" msec" << std::endl;
 
+  }
+  
     int reads_started = 0;
 
         //  Iterate through all files and directories on command line.
@@ -760,8 +766,8 @@ int main(int argc, char *argv[]) {
             gettimeofday(&start, NULL);
             std::cerr << "\nFinding candidate bin locations for each read: " << std::endl;
             std::vector<std::thread> align_threads;
-            for (int k = 0; k < num_threads; k++) {
-                align_threads.push_back(std::thread(AlignRead, k, num_reads, num_threads));
+            for (int k = 0; k < num_references; k++) {
+                align_threads.push_back(std::thread(AlignRead, k, num_reads, num_references));
             }
             std::cerr << "Using " << align_threads.size() << " threads ...\n";
             for (auto& th : align_threads) th.join();
@@ -818,7 +824,7 @@ bool init() {
   context = clCreateContext(NULL, num_devices, &devices[0], NULL, NULL, &status);
   checkError(status, "Failed to create context");
 
-  queues.reset(num_devices*num_threads);
+  queues.reset(num_devices*num_reference);
   kernels.reset(num_devices*num_threads);
   kernel_events.reset(num_devices*num_threads*20);
 
